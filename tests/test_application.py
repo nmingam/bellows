@@ -691,6 +691,110 @@ def test_gp_frame_handler_short_args_dropped(app):
     assert app.packet_received.call_count == 0
 
 
+# ---------------------------------------------------------------------------
+# Cross-repo integration: EZSP callback → bellows → zigpy.green_power listener
+# ---------------------------------------------------------------------------
+#
+# These tests restore the real ``packet_received`` method (the make_app
+# fixture replaces it with a MagicMock) so a GP frame delivered through
+# gpepIncomingMessageHandler actually reaches zigpy's GreenPowerManager
+# and fires the documented listener events. Without this the Phase 1
+# wiring could pass unit tests but still be silently broken end to end.
+
+
+def _install_real_packet_received(app):
+    """Restore zigpy's real packet_received on top of the MagicMock."""
+    import zigpy.application
+
+    app.packet_received = zigpy.application.ControllerApplication.packet_received.__get__(
+        app
+    )
+    # bellows' make_app does not wrap listener_event (zigpy's conftest
+    # does). Wrap it here so we can assert events fired by the GP
+    # manager.
+    app.listener_event = MagicMock(wraps=app.listener_event)
+
+
+@pytest.mark.asyncio
+async def test_gpep_callback_cross_repo_toggle(app):
+    """A Toggle GPDF delivered via EZSP triggers gp_command_received in zigpy."""
+    from zigpy.zgp.device import GPDevice
+    from zigpy.zgp.types import GPDCommandID
+
+    _install_real_packet_received(app)
+
+    # Pre-register the device so we bypass commissioning/decrypt for this
+    # test; we only care about the Toggle path here.
+    source_id = 0x0171F886
+    dev = GPDevice(source_id=source_id, device_id=0x02, frame_counter=0)
+    app.green_power.add_device(dev)
+
+    app.ezsp_callback_handler(
+        "gpepIncomingMessageHandler",
+        _gp_args_v13(
+            source_id=source_id,
+            command_id=int(GPDCommandID.Toggle),
+            payload=b"",
+            frame_counter=42,
+        ),
+    )
+
+    # GreenPowerManager.handle_packet schedules the actual work through
+    # create_task; let the event loop run it to completion.
+    await asyncio.sleep(0.05)
+
+    app.listener_event.assert_any_call(
+        "gp_command_received",
+        dev,
+        GPDCommandID.Toggle,
+        b"",
+    )
+    assert dev.frame_counter == 42
+
+
+@pytest.mark.asyncio
+async def test_gpep_callback_cross_repo_commissioning(app):
+    """A commissioning GPDF delivered via EZSP registers the device in zigpy."""
+    from zigpy.zgp.types import GP_CLUSTER_ID, GP_ENDPOINT
+
+    _install_real_packet_received(app)
+    app.send_packet = AsyncMock()
+
+    # Open the commissioning window first so the frame is not ignored.
+    await app.green_power.permit_join(time_s=60)
+    assert app.green_power.is_commissioning
+    app.listener_event.reset_mock()
+
+    # Minimal NoSecurity commissioning payload: device_id=0x02, options=0x00.
+    # This avoids needing to know the OOB key — the crypto path is
+    # exercised by the dedicated zigpy unit tests.
+    commissioning_payload = bytes([0x02, 0x00])
+    source_id = 0xAABBCCDD
+
+    app.ezsp_callback_handler(
+        "gpepIncomingMessageHandler",
+        _gp_args_v13(
+            source_id=source_id,
+            command_id=0xE0,  # CommissioningRequest
+            payload=commissioning_payload,
+            frame_counter=1,
+        ),
+    )
+
+    await asyncio.sleep(0.05)
+
+    dev = app.green_power.get_device(source_id)
+    assert dev is not None
+    assert dev.device_id == 0x02
+    app.listener_event.assert_any_call("gp_device_joined", dev)
+
+    # The manager should have sent at least one GP Pairing/Response packet.
+    assert app.send_packet.call_count >= 1
+    sent = app.send_packet.call_args_list[0][0][0]
+    assert sent.cluster_id == GP_CLUSTER_ID
+    assert sent.dst_ep == GP_ENDPOINT
+
+
 @pytest.mark.parametrize(
     "msg_type",
     (
